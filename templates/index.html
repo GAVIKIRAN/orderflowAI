@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OrderFlow AI — Manufacturing Order Management</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.47.0/tabler-icons.min.css" />
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+<div class="app-shell">
+
+  <!-- ── SIDEBAR ─────────────────────────────────────────── -->
+  <aside class="sidebar">
+
+    <div class="sidebar-brand">
+      <div class="brand-icon">
+        <i class="ti ti-cpu" aria-hidden="true"></i>
+      </div>
+      <div class="brand-text">
+        <span class="brand-name">OrderFlow <em>AI</em></span>
+        <span class="brand-sub">Manufacturing OS</span>
+      </div>
+    </div>
+
+    <div class="sidebar-section-label">Navigation</div>
+
+    <nav class="sidebar-nav">
+      <button class="nav-item active" onclick="showView('chat')" data-view="chat">
+        <i class="ti ti-message-2" aria-hidden="true"></i>
+        <span>Chat</span>
+        <span class="nav-badge online" id="onlineDot"></span>
+      </button>
+      <button class="nav-item" onclick="showView('dashboard')" data-view="dashboard">
+        <i class="ti ti-layout-dashboard" aria-hidden="true"></i>
+        <span>Dashboard</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-divider"></div>
+    <div class="sidebar-section-label">Quick Commands</div>
+
+    <div class="quick-cmds">
+      <div class="quick-cmd" onclick="injectCmd('I need 500 steel rods 20mm by Aug 10')">
+        <i class="ti ti-plus" aria-hidden="true"></i> Place an order
+      </div>
+      <div class="quick-cmd" onclick="injectCmd('Mark order #42 as accepted')">
+        <i class="ti ti-refresh" aria-hidden="true"></i> Update status
+      </div>
+      <div class="quick-cmd" onclick="injectCmd('Log quality for order #42: visual inspection passed')">
+        <i class="ti ti-shield-check" aria-hidden="true"></i> Log quality
+      </div>
+      <div class="quick-cmd" onclick="injectCmd('Show me all orders')">
+        <i class="ti ti-list" aria-hidden="true"></i> List all orders
+      </div>
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="sidebar-footer-info">
+        <span class="dot green"></span>
+        Claude API connected
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ── MAIN PANEL ─────────────────────────────────────── -->
+  <main class="main-panel">
+
+    <!-- ═══ CHAT VIEW ════════════════════════════════════ -->
+    <div class="view active" id="view-chat">
+
+      <header class="panel-header">
+        <div class="header-left">
+          <h1 class="panel-title">AI Order Assistant</h1>
+          <p class="panel-sub">Place orders · update status · log quality — all in natural language</p>
+        </div>
+        <div class="header-right">
+          <span class="status-pill">
+            <span class="dot green pulse"></span>
+            Live
+          </span>
+        </div>
+      </header>
+
+      <div class="chat-body" id="chatMessages">
+
+        <!-- Welcome message -->
+        <div class="msg-row ai">
+          <div class="msg-avatar ai-avatar">
+            <i class="ti ti-robot" aria-hidden="true"></i>
+          </div>
+          <div class="msg-content">
+            <div class="msg-meta">OrderFlow AI <span class="msg-time">now</span></div>
+            <div class="msg-bubble">
+              <p>Welcome to <strong>OrderFlow AI</strong> — your conversational manufacturing assistant.</p>
+              <div class="capability-grid">
+                <div class="cap-item">
+                  <i class="ti ti-package" aria-hidden="true"></i>
+                  <span><strong>Place orders</strong><br>Describe what you need in plain language</span>
+                </div>
+                <div class="cap-item">
+                  <i class="ti ti-refresh-alert" aria-hidden="true"></i>
+                  <span><strong>Update status</strong><br>"Mark order #42 as accepted"</span>
+                </div>
+                <div class="cap-item">
+                  <i class="ti ti-shield-check" aria-hidden="true"></i>
+                  <span><strong>Log quality</strong><br>"Log quality for #42: inspection passed"</span>
+                </div>
+                <div class="cap-item">
+                  <i class="ti ti-search" aria-hidden="true"></i>
+                  <span><strong>Check status</strong><br>"What's the status of order #42?"</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="chat-footer">
+        <div class="input-container">
+          <textarea
+            id="chatInput"
+            class="chat-textarea"
+            placeholder="Type your order or command…"
+            rows="1"
+            onkeydown="handleKey(event)"
+            oninput="autoResize(this)"
+            aria-label="Chat input"
+          ></textarea>
+          <button class="send-btn" id="sendBtn" onclick="sendMessage()" aria-label="Send message">
+            <i class="ti ti-send" aria-hidden="true"></i>
+          </button>
+        </div>
+        <div class="input-hint">
+          <i class="ti ti-keyboard" aria-hidden="true"></i>
+          Press <kbd>Enter</kbd> to send · <kbd>Shift+Enter</kbd> for new line
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ═══ DASHBOARD VIEW ═══════════════════════════════ -->
+    <div class="view" id="view-dashboard">
+
+      <header class="panel-header">
+        <div class="header-left">
+          <h1 class="panel-title">Order Tracking Dashboard</h1>
+          <p class="panel-sub">Real-time manufacturing order visibility</p>
+        </div>
+        <div class="header-right">
+          <button class="btn-secondary" onclick="loadDashboard()">
+            <i class="ti ti-refresh" aria-hidden="true"></i>
+            Refresh
+          </button>
+        </div>
+      </header>
+
+      <div class="dashboard-body">
+
+        <div class="stats-grid">
+          <div class="stat-tile">
+            <div class="stat-icon neutral">
+              <i class="ti ti-clipboard-list" aria-hidden="true"></i>
+            </div>
+            <div class="stat-body">
+              <div class="stat-value" id="statTotal">—</div>
+              <div class="stat-label">Total Orders</div>
+            </div>
+          </div>
+          <div class="stat-tile">
+            <div class="stat-icon amber">
+              <i class="ti ti-hourglass" aria-hidden="true"></i>
+            </div>
+            <div class="stat-body">
+              <div class="stat-value amber" id="statReceived">—</div>
+              <div class="stat-label">Received</div>
+            </div>
+          </div>
+          <div class="stat-tile">
+            <div class="stat-icon blue">
+              <i class="ti ti-eye" aria-hidden="true"></i>
+            </div>
+            <div class="stat-body">
+              <div class="stat-value blue" id="statReview">—</div>
+              <div class="stat-label">In Review</div>
+            </div>
+          </div>
+          <div class="stat-tile">
+            <div class="stat-icon green">
+              <i class="ti ti-circle-check" aria-hidden="true"></i>
+            </div>
+            <div class="stat-body">
+              <div class="stat-value green" id="statAccepted">—</div>
+              <div class="stat-label">Accepted</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="table-section">
+          <div class="table-header-row">
+            <h2 class="table-heading">All Orders</h2>
+            <div class="table-controls">
+              <div class="filter-group" id="filterGroup">
+                <button class="filter-btn active" onclick="filterTable('all', this)">All</button>
+                <button class="filter-btn" onclick="filterTable('Received', this)">Received</button>
+                <button class="filter-btn" onclick="filterTable('In Review', this)">In Review</button>
+                <button class="filter-btn" onclick="filterTable('Accepted', this)">Accepted</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table class="orders-table" id="ordersTable">
+              <thead>
+                <tr>
+                  <th>Order ID</th>
+                  <th>Part Name</th>
+                  <th>Material</th>
+                  <th>Qty</th>
+                  <th>Deadline</th>
+                  <th>Status</th>
+                  <th>Latest Quality Note</th>
+                </tr>
+              </thead>
+              <tbody id="ordersTableBody">
+                <tr><td colspan="7" class="table-empty">
+                  <i class="ti ti-loader" aria-hidden="true"></i> Loading orders…
+                </td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
