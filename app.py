@@ -1,225 +1,1552 @@
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-import anthropic
+from database import get_db, init_db
+
+import sqlite3
+import requests
 import json
 import re
+import statistics
 from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
-# ── In-memory store ──────────────────────────────────────────────
-orders = {}
-order_counter = [41]  # starts so first order is #42
-
-def next_id():
-    order_counter[0] += 1
-    return order_counter[0]
-
-# ── Claude client ────────────────────────────────────────────────
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+OLLAMA_URL = "http://100.71.169.79:11434/api/generate"
 
 STATUS_FLOW = ["Received", "In Review", "Accepted"]
 
-# ── Helpers ──────────────────────────────────────────────────────
-def extract_json(text):
-    """Pull the first {...} block from a Claude response."""
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match:
-        return json.loads(match.group())
-    return json.loads(text)
 
-def classify_intent(message):
-    """Ask Claude to classify intent and extract structured data."""
-    prompt = f"""You are an intent classifier for a manufacturing order system.
-Classify the user message into ONE intent and extract relevant fields.
+# ─────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────
+
+def extract_json(text):
+    try:
+        match = re.search(r"\{[\s\S]*\}", text)
+        if match:
+            return json.loads(match.group())
+        return {"intent": "unknown"}
+    except Exception as e:
+        print("JSON ERROR:", e)
+        print(text)
+        return {"intent": "unknown"}
+
+
+def detect_language(text):
+    try:
+        prompt = f"""
+Detect the language.
+
+Return ONLY one word:
+
+english
+telugu
+kannada
+hindi
+tamil
+malayalam
+
+Text:
+{text}
+"""
+        response = requests.post(
+            OLLAMA_URL,
+            json={"model": "qwen2.5:7b", "prompt": prompt, "stream": False},
+            timeout=30
+        )
+        return response.json()["response"].strip().lower()
+    except:
+        return "english"
+
+
+def get_inventory_names() -> list[str]:
+    """Fetch all part names from the DB to use as translation anchors."""
+    try:
+        conn = get_db()
+        rows = conn.execute("SELECT part_name FROM inventory").fetchall()
+        conn.close()
+        return [r["part_name"] for r in rows]
+    except Exception:
+        return []
+
+
+def translate_to_english(text: str) -> str:
+    """
+    Translate regional-language user input to English.
+
+    Strategy:
+    1. Pull actual inventory part names from the DB.
+    2. Give the model those names as a reference glossary so it matches
+       known terms (e.g. 'Steel Rods') instead of guessing ('Steel Rails').
+    3. Ask the model to preserve numbers and quantities exactly.
+    """
+    inventory_names = get_inventory_names()
+    glossary_block  = ""
+    if inventory_names:
+        glossary_block = (
+            "Known inventory items in this system — "
+            "prefer these exact English names when translating:\n"
+            + "\n".join(f"  - {n}" for n in inventory_names)
+            + "\n\n"
+        )
+
+    prompt = f"""You are a manufacturing inventory assistant translator.
+
+{glossary_block}Translate the user message below into English.
+
+Rules:
+- Return ONLY the translated text, nothing else.
+- Keep all numbers exactly as they are.
+- For part/material names, match the closest item from the Known inventory list above if one fits.
+- Do NOT invent or paraphrase inventory terms — use the exact name from the list.
+- If no inventory item matches, translate as literally as possible.
+
+User message:
+{text}
+"""
+
+    response = requests.post(
+        OLLAMA_URL,
+        json={"model": "qwen2.5:7b", "prompt": prompt, "stream": False},
+        timeout=60
+    )
+    translated = response.json()["response"].strip()
+
+    # ── Post-process: fuzzy-match any inventory name against the translation ──
+    # If the model still got it wrong, correct it by finding the closest
+    # inventory name using simple substring / token overlap.
+    translated = _correct_part_name(translated, inventory_names)
+
+    print("TRANSLATED:", translated)
+    return translated
+
+
+def _correct_part_name(translated: str, inventory_names: list[str]) -> str:
+    """
+    Last-resort correction: if a known inventory part name shares significant
+    tokens with any word in the translated string, replace that word with the
+    canonical inventory name.
+
+    Example: 'Steel Rails' → 'Steel Rods'  (because 'Steel Rods' is in inventory
+    and both share the token 'Steel', and 'Rails'/'Rods' are close enough in context)
+    """
+    if not inventory_names:
+        return translated
+
+    translated_lower = translated.lower()
+
+    for name in inventory_names:
+        name_tokens = set(name.lower().split())
+        # Check how many tokens of this inventory name appear in the translation
+        matches = sum(1 for token in name_tokens if token in translated_lower)
+        coverage = matches / len(name_tokens) if name_tokens else 0
+
+        # If >50% of the inventory name's tokens appear in the translation,
+        # the user almost certainly meant this item — replace the translated
+        # portion with the canonical name.
+        if coverage >= 0.5 and coverage < 1.0:
+            # Find which tokens are missing and which are present
+            present_tokens = [t for t in name_tokens if t in translated_lower]
+            if present_tokens:
+                # Build a pattern from the present tokens and replace with full name
+                import re
+                # Replace the first token match region with the full canonical name
+                pattern = r'\b' + r'\b.*?\b'.join(re.escape(t) for t in present_tokens) + r'\b'
+                corrected = re.sub(pattern, name, translated, count=1, flags=re.IGNORECASE)
+                if corrected != translated:
+                    print(f"PART NAME CORRECTED: '{translated}' → '{corrected}' (matched '{name}')")
+                    return corrected
+
+        # Exact full match — already correct, nothing to do
+        if coverage == 1.0:
+            return translated
+
+    return translated
+
+
+# translate_response removed — system always replies in English.
+
+
+def classify_intent(message: str) -> dict:
+    prompt = f"""
+You are OrderFlow AI — a manufacturing inventory assistant.
+
+The message below is already translated to English. Extract order/inventory information from it.
+
+Return ONLY valid JSON with NO extra text, explanation, or markdown.
 
 Intents:
-- create_order: user wants to place a new order
-- update_status: user wants to update/progress an order status
-- log_quality: user wants to log a quality checkpoint for an order
-- query_order: user wants to know the status or details of an order
-- list_orders: user wants to see all orders
-- unknown: none of the above
+  create_order    - user wants to order / buy / get / need items
+  update_status   - update or advance an order status
+  query_order     - check details of a specific order
+  list_orders     - list all orders
+  log_quality     - log a quality note for an order
+  list_inventory  - show all inventory
+  query_inventory - check stock of a specific item
+  consume_stock   - consume / use stock from inventory
 
-User message: "{message}"
+Rules for part_name:
+  - ALWAYS extract the item name from the message.
+  - If the user says "I need 50 steel rods", part_name = "steel rods"
+  - If the user says "order hex bolts", part_name = "hex bolts"
+  - NEVER leave part_name as null if a product name is mentioned.
+  - Use the exact words from the message for part_name.
 
-Respond ONLY with valid JSON (no markdown, no explanation):
+Message:
+{message}
+
+Respond with ONLY this JSON (fill in the values, keep nulls only where truly absent):
+
 {{
-  "intent": "<intent>",
-  "order_id": <number or null>,
-  "part_name": "<string or null>",
-  "material": "<string or null>",
-  "quantity": <number or null>,
-  "specs": "<extra specs like bore size or null>",
-  "deadline": "<date string or null>",
-  "new_status": "<Received|In Review|Accepted or null>",
-  "quality_note": "<string or null>"
-}}"""
+  "intent": "",
+  "inventory_id": null,
+  "order_id": null,
+  "part_name": null,
+  "material": null,
+  "quantity": null,
+  "specs": null,
+  "deadline": null,
+  "new_status": null,
+  "quality_note": null
+}}
+"""
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={"model": "qwen2.5:7b", "prompt": prompt, "stream": False},
+            timeout=120
+        )
+        result = response.json()["response"]
 
-    resp = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=512,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return extract_json(resp.content[0].text)
+        print("\n========== OLLAMA ==========")
+        print("USER:", message)
+        print("MODEL:", result)
+        print("============================\n")
 
-# ── Routes ───────────────────────────────────────────────────────
+        parsed = extract_json(result)
+        print("PARSED:", parsed)
+        return parsed
+
+    except Exception as e:
+        print("OLLAMA ERROR:", e)
+        return {"intent": "unknown"}
+
+
+def maybe_trigger_reorder(conn, inv_id: int):
+    """If stock <= reorder_at, auto-create a purchase order."""
+    row = conn.execute(
+        "SELECT * FROM inventory WHERE id = ?", (inv_id,)
+    ).fetchone()
+    if not row:
+        return None
+
+    if row["quantity"] <= row["reorder_at"]:
+        reorder_qty = max(row["reorder_at"] * 5, 50)
+        conn.execute("""
+            INSERT INTO orders
+                (inventory_id, part_name, material, quantity, specs, deadline, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'Received', ?)
+        """, (
+            row["id"],
+            row["part_name"],
+            row["material"],
+            reorder_qty,
+            f"Auto-reorder: stock fell to {row['quantity']} (threshold {row['reorder_at']})",
+            "",
+            datetime.now().isoformat(),
+        ))
+        conn.commit()
+        return {
+            "triggered": True,
+            "part_name": row["part_name"],
+            "reorder_qty": reorder_qty,
+            "current_stock": row["quantity"],
+        }
+    return {"triggered": False}
+
+
+# ─────────────────────────────────────────────────────────
+# Page
+# ─────────────────────────────────────────────────────────
+
 @app.route("/")
 def index():
     return render_template("index.html")
 
+
+# ─────────────────────────────────────────────────────────
+# Inventory — GET all / POST add new item
+# ─────────────────────────────────────────────────────────
+
+@app.route("/api/inventory", methods=["GET"])
+def get_inventory():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM inventory ORDER BY part_name").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/inventory", methods=["POST"])
+def add_inventory_item():
+    """Add a new item to the inventory catalog."""
+    data = request.get_json()
+    # _s(): safely strip any value that might be None
+    def _s(val, default=""):
+        return (val if val is not None else default).strip()
+
+    if not data or not _s(data.get("part_name")):
+        return jsonify({"message": "part_name is required"}), 400
+
+    conn = get_db()
+    try:
+        conn.execute("""
+            INSERT INTO inventory
+                (part_name, material, unit, quantity, reorder_at, rfid_tag, barcode, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            _s(data.get("part_name")),
+            _s(data.get("material"))     or None,
+            _s(data.get("unit"), "pcs") or "pcs",
+            int(data.get("quantity")  or 0),
+            int(data.get("reorder_at") or 10),
+            _s(data.get("rfid_tag"))     or None,
+            _s(data.get("barcode"))      or None,
+            datetime.now().isoformat(),
+        ))
+        conn.commit()
+        new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+        return jsonify({
+            "message": f"✅ '{data['part_name']}' added to inventory as item #{new_id}",
+            "id": new_id,
+        })
+    except sqlite3.IntegrityError as e:
+        conn.close()
+        return jsonify({"message": f"❌ Error: {e} — RFID tag or barcode may already exist"}), 400
+
+
+@app.route("/api/inventory/<int:iid>", methods=["GET"])
+def get_inventory_item(iid):
+    conn = get_db()
+    row  = conn.execute("SELECT * FROM inventory WHERE id = ?", (iid,)).fetchone()
+    conn.close()
+    return (jsonify(dict(row)), 200) if row else (jsonify({"message": "Not found"}), 404)
+
+
+@app.route("/api/inventory/<int:iid>", methods=["DELETE"])
+def delete_inventory_item(iid):
+    """Delete an inventory item (only if no orders reference it)."""
+    conn = get_db()
+    orders = conn.execute(
+        "SELECT COUNT(*) FROM orders WHERE inventory_id = ?", (iid,)
+    ).fetchone()[0]
+    if orders > 0:
+        conn.close()
+        return jsonify({"message": f"❌ Cannot delete — {orders} order(s) reference this item"}), 400
+    conn.execute("DELETE FROM inventory WHERE id = ?", (iid,))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": f"✅ Inventory item #{iid} deleted"})
+
+
+# ─────────────────────────────────────────────────────────
+# Orders — REST
+# ─────────────────────────────────────────────────────────
+
+@app.route("/api/orders/<int:oid>/status", methods=["PATCH"])
+def set_order_status(oid):
+    """Directly set an order's status — bypasses LLM, used by dashboard buttons."""
+    data   = request.get_json(silent=True) or {}
+    status = (data.get("status") or "").strip()
+
+    STATUS_MAP = {
+        "received":   "Received",
+        "in review":  "In Review",
+        "inreview":   "In Review",
+        "accepted":   "Accepted",
+    }
+
+    canonical = STATUS_MAP.get(status.lower())
+    if not canonical:
+        return jsonify({"message": f"Invalid status '{status}'. Choose: Received, In Review, Accepted"}), 400
+
+    conn = get_db()
+    row  = conn.execute("SELECT id FROM orders WHERE id = ?", (oid,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"message": "Order not found"}), 404
+
+    conn.execute("UPDATE orders SET status = ? WHERE id = ?", (canonical, oid))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": f"✅ Order #{oid} → '{canonical}'", "status": canonical})
+
+
+@app.route("/api/orders")
+def get_orders():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM orders ORDER BY id DESC").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/orders/<int:oid>")
+def get_order(oid):
+    conn = get_db()
+    row  = conn.execute("SELECT * FROM orders WHERE id = ?", (oid,)).fetchone()
+    conn.close()
+    return (jsonify(dict(row)), 200) if row else (jsonify({"message": "Not found"}), 404)
+
+
+# ─────────────────────────────────────────────────────────
+# RFID
+# ─────────────────────────────────────────────────────────
+
+@app.route("/api/rfid/<tag>")
+def lookup_rfid(tag):
+    conn = get_db()
+    row  = conn.execute(
+        "SELECT * FROM inventory WHERE rfid_tag = ?", (tag,)
+    ).fetchone()
+    conn.close()
+    return (jsonify(dict(row)), 200) if row else (jsonify({"message": "RFID tag not found"}), 404)
+
+
+@app.route("/api/rfid/<tag>/scan", methods=["POST"])
+def scan_rfid(tag):
+    data = request.get_json(silent=True) or {}
+    qty  = int(data.get("qty", 1))
+
+    conn = get_db()
+    row  = conn.execute(
+        "SELECT * FROM inventory WHERE rfid_tag = ?", (tag,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"message": "RFID tag not found"}), 404
+
+    if qty > row["quantity"]:
+        conn.close()
+        return jsonify({
+            "message": (
+                f"❌ Insufficient stock for '{row['part_name']}'. "
+                f"Requested: {qty} {row['unit']}, "
+                f"Available: {row['quantity']} {row['unit']}."
+            ),
+            "insufficient_stock": True,
+            "available": row["quantity"],
+            "requested": qty,
+        }), 400
+
+    new_qty = row["quantity"] - qty
+    conn.execute("UPDATE inventory SET quantity = ? WHERE id = ?", (new_qty, row["id"]))
+    conn.commit()
+
+    reorder = maybe_trigger_reorder(conn, row["id"])
+
+    conn.execute("""
+        INSERT INTO scan_events
+            (inventory_id, scan_type, tag_value, qty_consumed, order_triggered, scanned_at)
+        VALUES (?, 'RFID', ?, ?, ?, ?)
+    """, (
+        row["id"], tag, qty,
+        1 if (reorder and reorder["triggered"]) else 0,
+        datetime.now().isoformat(),
+    ))
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "item": {**dict(row), "quantity": new_qty},
+        "consumed": qty,
+        "new_stock": new_qty,
+        "reorder": reorder,
+        "message": (
+            f"✅ Consumed {qty}. Stock: {new_qty}/{row['reorder_at']} threshold."
+            + (f"\n🔔 Auto-reorder triggered for {reorder['reorder_qty']} units!"
+               if reorder and reorder["triggered"] else "")
+        ),
+    })
+
+
+# ─────────────────────────────────────────────────────────
+# Barcode
+# ─────────────────────────────────────────────────────────
+
+@app.route("/api/barcode/<code>")
+def lookup_barcode(code):
+    conn = get_db()
+    row  = conn.execute(
+        "SELECT * FROM inventory WHERE barcode = ?", (code,)
+    ).fetchone()
+    conn.close()
+    return (jsonify(dict(row)), 200) if row else (jsonify({"message": "Barcode not found"}), 404)
+
+
+@app.route("/api/barcode/<code>/scan", methods=["POST"])
+def scan_barcode(code):
+    data = request.get_json(silent=True) or {}
+    qty  = int(data.get("qty", 1))
+
+    conn = get_db()
+    row  = conn.execute(
+        "SELECT * FROM inventory WHERE barcode = ?", (code,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"message": "Barcode not found"}), 404
+
+    if qty > row["quantity"]:
+        conn.close()
+        return jsonify({
+            "message": (
+                f"❌ Insufficient stock for '{row['part_name']}'. "
+                f"Requested: {qty} {row['unit']}, "
+                f"Available: {row['quantity']} {row['unit']}."
+            ),
+            "insufficient_stock": True,
+            "available": row["quantity"],
+            "requested": qty,
+        }), 400
+
+    new_qty = row["quantity"] - qty
+    conn.execute("UPDATE inventory SET quantity = ? WHERE id = ?", (new_qty, row["id"]))
+    conn.commit()
+
+    reorder = maybe_trigger_reorder(conn, row["id"])
+
+    conn.execute("""
+        INSERT INTO scan_events
+            (inventory_id, scan_type, tag_value, qty_consumed, order_triggered, scanned_at)
+        VALUES (?, 'BARCODE', ?, ?, ?, ?)
+    """, (
+        row["id"], code, qty,
+        1 if (reorder and reorder["triggered"]) else 0,
+        datetime.now().isoformat(),
+    ))
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "item": {**dict(row), "quantity": new_qty},
+        "consumed": qty,
+        "new_stock": new_qty,
+        "reorder": reorder,
+        "message": (
+            f"✅ Consumed {qty}. Stock: {new_qty}/{row['reorder_at']} threshold."
+            + (f"\n🔔 Auto-reorder triggered for {reorder['reorder_qty']} units!"
+               if reorder and reorder["triggered"] else "")
+        ),
+    })
+
+
+# ─────────────────────────────────────────────────────────
+# Chat / AI  ← ALL LANGUAGE FIXES ARE HERE
+# ─────────────────────────────────────────────────────────
+
+# _translate_json_response removed — responses are always English.
+
+
 @app.route("/api/chat", methods=["POST"])
 def chat():
-    data = request.json
-    message = data.get("message", "").strip()
-    if not message:
-        return jsonify({"error": "Empty message"}), 400
-
     try:
-        extracted = classify_intent(message)
-        intent = extracted.get("intent", "unknown")
+        data    = request.get_json()
+        message = data.get("message", "")
 
-        # ── CREATE ORDER ─────────────────────────────────────────
+        # ── 1. Detect language & normalise to English for the LLM ──
+        user_language   = detect_language(message)
+        english_message = message
+
+        if user_language != "english":
+            english_message = translate_to_english(message)
+
+        print("Language:", user_language)
+        print("English :", english_message)
+
+        # ── 2. Classify intent (always in English) ──────────────────
+        extracted = classify_intent(english_message)
+        intent    = extracted.get("intent")
+        conn      = get_db()
+
+        # helper: return a JSON response (always English)
+        def reply(payload: dict, status: int = 200):
+            return jsonify(payload), status
+
+        # ── CREATE ORDER ────────────────────────────────────────────
         if intent == "create_order":
-            oid = next_id()
-            order = {
-                "id": oid,
-                "part_name": extracted.get("part_name") or "Unknown Part",
-                "material": extracted.get("material") or "N/A",
-                "quantity": extracted.get("quantity") or 0,
-                "specs": extracted.get("specs") or "",
-                "deadline": extracted.get("deadline") or "TBD",
-                "status": "Received",
-                "quality_logs": [],
-                "created_at": datetime.now().isoformat()
-            }
-            orders[oid] = order
-            return jsonify({
-                "type": "order_created",
-                "message": f"✅ Order #{oid} created — Status: Received",
-                "order": order
+            inv_id    = extracted.get("inventory_id")
+            part_name = extracted.get("part_name")
+
+            # ── Fallback: if LLM returned null part_name, mine the message ──
+            if not part_name and not inv_id:
+                # Strip common filler words and use whatever nouns remain
+                filler = {"i", "need", "want", "order", "get", "buy", "please",
+                          "me", "some", "the", "a", "an", "of", "for", "give",
+                          "can", "you", "us", "we", "our", "stock"}
+                words  = [w for w in english_message.lower().split()
+                          if w.isalpha() and w not in filler and len(w) > 2]
+                if words:
+                    part_name = " ".join(words)
+                    print(f"FALLBACK part_name from message: '{part_name}'")
+
+            # ── Multi-strategy fuzzy inventory lookup ────────────────
+            inv_row    = None
+            candidates = []   # used when multiple items match
+
+            if inv_id:
+                # Exact ID match — fastest, always wins
+                inv_row = conn.execute(
+                    "SELECT * FROM inventory WHERE id = ?", (inv_id,)
+                ).fetchone()
+
+            elif part_name:
+                pn_lower = part_name.strip().lower()
+
+                # Strategy 1: exact substring match  e.g. "steel rod" in "Steel Rod 20mm"
+                rows = conn.execute(
+                    "SELECT * FROM inventory WHERE LOWER(part_name) LIKE LOWER(?)",
+                    (f"%{pn_lower}%",),
+                ).fetchall()
+
+                if len(rows) == 1:
+                    inv_row = rows[0]                 # unambiguous → use it
+                elif len(rows) > 1:
+                    candidates = list(rows)           # multiple → ask user
+
+                else:
+                    # Strategy 2: every word in part_name must appear somewhere in db name
+                    # e.g. ["steel", "rod"] both appear in "Steel Rod 20mm"
+                    words = [w for w in pn_lower.split() if len(w) > 2]
+                    all_items = conn.execute("SELECT * FROM inventory").fetchall()
+
+                    scored = []
+                    for item in all_items:
+                        item_lower = item["part_name"].lower()
+                        hits = sum(1 for w in words if w in item_lower)
+                        if hits > 0:
+                            scored.append((hits, item))
+
+                    scored.sort(key=lambda x: -x[0])
+
+                    if scored:
+                        best_score = scored[0][0]
+                        top = [item for score, item in scored if score == best_score]
+
+                        if len(top) == 1:
+                            inv_row = top[0]          # clear winner
+                        else:
+                            candidates = top          # tie → ask user
+
+            # ── Multiple matches: ask user to pick ──────────────────
+            if candidates and not inv_row:
+                conn.close()
+                return reply({
+                    "message": (
+                        f"🔍 Found {len(candidates)} items matching '{part_name}'. "
+                        "Which one did you mean? Click a row to select it."
+                    ),
+                    "ambiguous": True,
+                    "matches": [
+                        {
+                            "id":        r["id"],
+                            "part_name": r["part_name"],
+                            "material":  r["material"],
+                            "quantity":  r["quantity"],
+                            "unit":      r["unit"],
+                        }
+                        for r in candidates
+                    ],
+                    "pending_qty": int(extracted.get("quantity") or 1),
+                })
+
+            # ── No match at all: show full inventory ─────────────────
+            if not inv_row:
+                items = conn.execute(
+                    "SELECT id, part_name, material, quantity, unit FROM inventory ORDER BY part_name"
+                ).fetchall()
+                conn.close()
+                return reply({
+                    "message": (
+                        f"⚠️ I couldn't find '{part_name or 'that item'}' in inventory. "
+                        "Please choose an item from the list below, "
+                        "or go to the Inventory tab to add it first."
+                    ),
+                    "inventory": [dict(r) for r in items],
+                })
+
+            qty = int(extracted.get("quantity") or 1)
+
+            if qty > inv_row["quantity"]:
+                conn.close()
+                return reply({
+                    "message": (
+                        f"❌ Insufficient stock for '{inv_row['part_name']}'. "
+                        f"You requested {qty} {inv_row['unit'] or 'pcs'} but only "
+                        f"{inv_row['quantity']} {inv_row['unit'] or 'pcs'} are available. "
+                        f"Please reduce the order quantity or wait for a restock."
+                    ),
+                    "insufficient_stock": True,
+                    "available": inv_row["quantity"],
+                    "requested": qty,
+                    "part_name": inv_row["part_name"],
+                    "unit": inv_row["unit"] or "pcs",
+                }, 400)
+
+            conn.execute("""
+                INSERT INTO orders
+                    (inventory_id, part_name, material, quantity, specs, deadline, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'Received', ?)
+            """, (
+                inv_row["id"],
+                inv_row["part_name"],
+                inv_row["material"],
+                qty,
+                extracted.get("specs") or "",
+                extracted.get("deadline") or "",
+                datetime.now().isoformat(),
+            ))
+            conn.commit()
+            new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+            new_qty = inv_row["quantity"] - qty
+            conn.execute(
+                "UPDATE inventory SET quantity = ? WHERE id = ?",
+                (new_qty, inv_row["id"])
+            )
+            conn.commit()
+
+            reorder = maybe_trigger_reorder(conn, inv_row["id"])
+            conn.close()
+
+            reorder_msg = ""
+            if reorder and reorder["triggered"]:
+                reorder_msg = (
+                    f"\n🔔 Stock hit threshold ({new_qty} ≤ {inv_row['reorder_at']})! "
+                    f"Auto-reorder triggered for {reorder['reorder_qty']} units."
+                )
+
+            return reply({
+                "message": (
+                    f"✅ Order #{new_id} created — "
+                    f"{qty} × {inv_row['part_name']} ({inv_row['material'] or 'N/A'}). "
+                    f"Stock remaining: {new_qty} {inv_row['unit'] or 'pcs'}."
+                    + reorder_msg
+                ),
+                "order": {
+                    "id": new_id,
+                    "inventory_id": inv_row["id"],
+                    "part_name": inv_row["part_name"],
+                    "material": inv_row["material"],
+                    "quantity": qty,
+                    "status": "Received",
+                    "new_stock": new_qty,
+                },
             })
 
-        # ── UPDATE STATUS ────────────────────────────────────────
-        elif intent == "update_status":
-            oid = extracted.get("order_id")
-            new_status = extracted.get("new_status")
+        # ── LIST ORDERS ─────────────────────────────────────────────
+        elif intent == "list_orders":
+            rows = conn.execute("SELECT * FROM orders ORDER BY id DESC").fetchall()
+            conn.close()
+            return reply({"orders": [dict(r) for r in rows]})
 
-            if oid and oid in orders:
-                old_status = orders[oid]["status"]
-                # Auto-advance if new_status not specified
-                if not new_status:
-                    idx = STATUS_FLOW.index(old_status)
-                    new_status = STATUS_FLOW[min(idx + 1, len(STATUS_FLOW) - 1)]
-                orders[oid]["status"] = new_status
-                return jsonify({
-                    "type": "status_updated",
-                    "message": f"✅ Order #{oid} status updated: {old_status} → {new_status}",
-                    "order": orders[oid]
-                })
-            elif oid:
-                return jsonify({"type": "error", "message": f"❌ Order #{oid} not found."})
-            else:
-                return jsonify({"type": "error", "message": "❌ Please specify an order ID."})
-
-        # ── LOG QUALITY ──────────────────────────────────────────
-        elif intent == "log_quality":
-            oid = extracted.get("order_id")
-            note = extracted.get("quality_note") or message
-
-            if oid and oid in orders:
-                if orders[oid]["status"] != "Accepted":
-                    return jsonify({
-                        "type": "error",
-                        "message": f"❌ Quality logging is only available once order is Accepted. Order #{oid} is currently '{orders[oid]['status']}'."
-                    })
-                log_entry = {
-                    "time": datetime.now().strftime("%I:%M %p"),
-                    "note": note
-                }
-                orders[oid]["quality_logs"].append(log_entry)
-                return jsonify({
-                    "type": "quality_logged",
-                    "message": f"🛡️ Quality checkpoint logged for Order #{oid}",
-                    "log": log_entry,
-                    "order": orders[oid]
-                })
-            elif oid:
-                return jsonify({"type": "error", "message": f"❌ Order #{oid} not found."})
-            else:
-                return jsonify({"type": "error", "message": "❌ Please specify an order ID for quality logging."})
-
-        # ── QUERY ORDER ──────────────────────────────────────────
+        # ── QUERY ORDER ─────────────────────────────────────────────
         elif intent == "query_order":
             oid = extracted.get("order_id")
-            if oid and oid in orders:
-                o = orders[oid]
-                return jsonify({
-                    "type": "order_info",
-                    "message": f"📦 Order #{oid} — {o['part_name']} × {o['quantity']} | Status: {o['status']} | Deadline: {o['deadline']}",
-                    "order": o
-                })
-            elif oid:
-                return jsonify({"type": "error", "message": f"❌ Order #{oid} not found."})
+            row = conn.execute("SELECT * FROM orders WHERE id = ?", (oid,)).fetchone()
+            conn.close()
+            if row:
+                return reply({"order": dict(row)})
+            return reply({"message": "Order not found"}, 404)
+
+        # ── UPDATE STATUS ───────────────────────────────────────────
+        elif intent == "update_status":
+            oid = extracted.get("order_id")
+            row = conn.execute("SELECT * FROM orders WHERE id = ?", (oid,)).fetchone()
+            if not row:
+                conn.close()
+                return reply({"message": "Order not found"}, 404)
+
+            requested = (extracted.get("new_status") or "").strip()
+
+            STATUS_MAP = {
+                "received":   "Received",
+                "in review":  "In Review",
+                "inreview":   "In Review",
+                "review":     "In Review",
+                "accepted":   "Accepted",
+                "accept":     "Accepted",
+                "approve":    "Accepted",
+                "approved":   "Accepted",
+                "done":       "Accepted",
+                "complete":   "Accepted",
+                "completed":  "Accepted",
+            }
+
+            if requested and requested.lower() in STATUS_MAP:
+                new_status = STATUS_MAP[requested.lower()]
             else:
-                return jsonify({"type": "error", "message": "❌ Please specify an order ID."})
+                current_idx = STATUS_FLOW.index(row["status"]) if row["status"] in STATUS_FLOW else -1
+                if current_idx < len(STATUS_FLOW) - 1:
+                    new_status = STATUS_FLOW[current_idx + 1]
+                else:
+                    conn.close()
+                    return reply({"message": f"⚠️ Order #{oid} is already at the final status: '{row['status']}'"})
 
-        # ── LIST ORDERS ──────────────────────────────────────────
-        elif intent == "list_orders":
-            return jsonify({
-                "type": "order_list",
-                "message": f"📋 Showing all {len(orders)} orders.",
-                "orders": list(orders.values())
-            })
+            conn.execute("UPDATE orders SET status = ? WHERE id = ?", (new_status, oid))
+            conn.commit()
+            conn.close()
+            return reply({"message": f"✅ Order #{oid} status set to '{new_status}'"})
 
-        # ── UNKNOWN ──────────────────────────────────────────────
+        # ── LOG QUALITY ─────────────────────────────────────────────
+        elif intent == "log_quality":
+            oid  = extracted.get("order_id")
+            note = extracted.get("quality_note") or english_message  # store English note in DB
+            conn.execute("""
+                INSERT INTO quality_logs (order_id, note, log_time)
+                VALUES (?, ?, ?)
+            """, (oid, note, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            return reply({"message": "✅ Quality log added"})
+
+        # ── LIST INVENTORY ──────────────────────────────────────────
+        elif intent == "list_inventory":
+            rows = conn.execute("SELECT * FROM inventory ORDER BY part_name").fetchall()
+            conn.close()
+            return reply({"inventory": [dict(r) for r in rows]})
+
+        # ── QUERY INVENTORY ─────────────────────────────────────────
+        elif intent == "query_inventory":
+            inv_id    = extracted.get("inventory_id")
+            part_name = extracted.get("part_name")
+            row = None
+            if inv_id:
+                row = conn.execute(
+                    "SELECT * FROM inventory WHERE id = ?", (inv_id,)
+                ).fetchone()
+            elif part_name:
+                row = conn.execute(
+                    "SELECT * FROM inventory WHERE LOWER(part_name) LIKE LOWER(?)",
+                    (f"%{part_name}%",),
+                ).fetchone()
+            conn.close()
+            if row:
+                return reply({"item": dict(row)})
+            return reply({"message": "Inventory item not found"}, 404)
+
+        # ── CONSUME STOCK ───────────────────────────────────────────
+        elif intent == "consume_stock":
+            inv_id = extracted.get("inventory_id")
+            qty    = int(extracted.get("quantity") or 1)
+            row    = conn.execute(
+                "SELECT * FROM inventory WHERE id = ?", (inv_id,)
+            ).fetchone()
+            if not row:
+                conn.close()
+                return reply({"message": "Inventory item not found"}, 404)
+
+            if qty > row["quantity"]:
+                conn.close()
+                return reply({
+                    "message": (
+                        f"❌ Insufficient stock for '{row['part_name']}'. "
+                        f"Requested: {qty} {row['unit']}, "
+                        f"Available: {row['quantity']} {row['unit']}."
+                    ),
+                    "insufficient_stock": True,
+                    "available": row["quantity"],
+                    "requested": qty,
+                }, 400)
+
+            new_qty = row["quantity"] - qty
+            conn.execute("UPDATE inventory SET quantity = ? WHERE id = ?", (new_qty, inv_id))
+            conn.commit()
+            reorder = maybe_trigger_reorder(conn, inv_id)
+            conn.close()
+
+            msg = f"✅ Consumed {qty} × {row['part_name']}. Stock now: {new_qty}"
+            if reorder and reorder["triggered"]:
+                msg += f"\n🔔 Reorder triggered for {reorder['reorder_qty']} units."
+            return reply({"message": msg})
+
+        # ── UNKNOWN ─────────────────────────────────────────────────
         else:
-            return jsonify({
-                "type": "unknown",
-                "message": "🤖 I can help you place orders, update statuses, log quality checkpoints, or check order status. Try: 'I need 200 titanium flanges by July 20' or 'Mark order #42 as accepted'."
+            conn.close()
+            return reply({
+                "message": (
+                    "I didn't understand that. Try:\n"
+                    "• 'Order 50 Steel Rods'\n"
+                    "• 'Show inventory'\n"
+                    "• 'Update order #3'\n"
+                    "• 'Log quality for order #1: inspection passed'"
+                )
             })
 
     except Exception as e:
-        return jsonify({"type": "error", "message": f"❌ Error: {str(e)}"}), 500
+        return jsonify({"message": f"Server error: {e}"}), 500
 
 
-@app.route("/api/orders", methods=["GET"])
-def get_orders():
-    return jsonify(list(orders.values()))
+# ─────────────────────────────────────────────────────────
+# Confirm-order  (used after ambiguous-match picker)
+# Frontend posts: { inventory_id, quantity }
+# ─────────────────────────────────────────────────────────
+
+@app.route("/api/chat/confirm-order", methods=["POST"])
+def confirm_order():
+    """
+    Called when the user clicks a row in the ambiguous-match picker.
+    Body: { "inventory_id": <int>, "quantity": <int> }
+    """
+    data   = request.get_json(silent=True) or {}
+    inv_id = data.get("inventory_id")
+    qty    = int(data.get("quantity") or 1)
+
+    if not inv_id:
+        return jsonify({"message": "inventory_id is required"}), 400
+
+    conn    = get_db()
+    inv_row = conn.execute("SELECT * FROM inventory WHERE id = ?", (inv_id,)).fetchone()
+    if not inv_row:
+        conn.close()
+        return jsonify({"message": "Inventory item not found"}), 404
+
+    if qty > inv_row["quantity"]:
+        conn.close()
+        return jsonify({
+            "message": (
+                f"Insufficient stock for '{inv_row['part_name']}'. "
+                f"Requested: {qty} {inv_row['unit'] or 'pcs'}, "
+                f"Available: {inv_row['quantity']} {inv_row['unit'] or 'pcs'}."
+            ),
+            "insufficient_stock": True,
+            "available": inv_row["quantity"],
+            "requested": qty,
+        }), 400
+
+    conn.execute(
+        "INSERT INTO orders (inventory_id, part_name, material, quantity, specs, deadline, status, created_at) VALUES (?, ?, ?, ?, \'\', \'\', \'Received\', ?)",
+        (inv_row["id"], inv_row["part_name"], inv_row["material"], qty, datetime.now().isoformat()),
+    )
+    conn.commit()
+    new_id  = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    new_qty = inv_row["quantity"] - qty
+    conn.execute("UPDATE inventory SET quantity = ? WHERE id = ?", (new_qty, inv_row["id"]))
+    conn.commit()
+
+    reorder = maybe_trigger_reorder(conn, inv_row["id"])
+    reorder_msg = ""
+    if reorder and reorder["triggered"]:
+        reorder_msg = (
+            f" Stock hit threshold ({new_qty} <= {inv_row['reorder_at']})! "
+            f"Auto-reorder triggered for {reorder['reorder_qty']} units."
+        )
+    conn.close()
+
+    return jsonify({
+        "message": (
+            f"Order #{new_id} created: "
+            f"{qty} x {inv_row['part_name']} ({inv_row['material'] or 'N/A'}). "
+            f"Stock remaining: {new_qty} {inv_row['unit'] or 'pcs'}."
+            + reorder_msg
+        ),
+        "order": {
+            "id":           new_id,
+            "inventory_id": inv_row["id"],
+            "part_name":    inv_row["part_name"],
+            "material":     inv_row["material"],
+            "quantity":     qty,
+            "status":       "Received",
+            "new_stock":    new_qty,
+        },
+    })
 
 
-@app.route("/api/orders/<int:oid>", methods=["GET"])
-def get_order(oid):
-    if oid in orders:
-        return jsonify(orders[oid])
-    return jsonify({"error": "Not found"}), 404
+# ─────────────────────────────────────────────────────────
+# DEMAND MANAGEMENT ROUTES
+# ─────────────────────────────────────────────────────────
 
+def _ensure_demand_tables(conn):
+    """Create demand-management tables if they don't exist yet."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS production_plans (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            inventory_id INTEGER,
+            part_name    TEXT NOT NULL,
+            target_qty   INTEGER NOT NULL,
+            start_date   TEXT,
+            end_date     TEXT,
+            notes        TEXT,
+            status       TEXT DEFAULT 'Planned',
+            created_at   TEXT,
+            FOREIGN KEY(inventory_id) REFERENCES inventory(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS suppliers (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL,
+            inventory_id INTEGER,
+            part_name    TEXT,
+            lead_days    INTEGER DEFAULT 7,
+            reliability  INTEGER DEFAULT 90,
+            contact      TEXT,
+            notes        TEXT,
+            created_at   TEXT,
+            FOREIGN KEY(inventory_id) REFERENCES inventory(id)
+        )
+    """)
+    conn.commit()
+
+
+# ── /api/demand/forecast ─────────────────────────────────
+@app.route("/api/demand/forecast")
+def demand_forecast():
+    conn  = get_db()
+    items = conn.execute("SELECT * FROM inventory").fetchall()
+
+    result = []
+    for item in items:
+        rows = conn.execute("""
+            SELECT DATE(scanned_at) as day, SUM(qty_consumed) as total
+            FROM   scan_events
+            WHERE  inventory_id = ?
+              AND  scanned_at >= DATE('now', '-30 days')
+            GROUP  BY DATE(scanned_at)
+            ORDER  BY day
+        """, (item["id"],)).fetchall()
+
+        daily_totals = [r["total"] for r in rows]
+
+        if daily_totals:
+            avg_daily    = round(sum(daily_totals) / 30, 2)
+            forecast_7d  = round(avg_daily * 7,  1)
+            forecast_30d = round(avg_daily * 30, 1)
+            trend = "stable"
+            if len(daily_totals) >= 6:
+                first_half  = statistics.mean(daily_totals[:len(daily_totals)//2])
+                second_half = statistics.mean(daily_totals[len(daily_totals)//2:])
+                if second_half > first_half * 1.2:
+                    trend = "rising"
+                elif second_half < first_half * 0.8:
+                    trend = "falling"
+        else:
+            avg_daily    = 0
+            forecast_7d  = 0
+            forecast_30d = 0
+            trend        = "no data"
+
+        days_until_out = (
+            round(item["quantity"] / avg_daily)
+            if avg_daily > 0 else None
+        )
+
+        result.append({
+            "id":            item["id"],
+            "part_name":     item["part_name"],
+            "material":      item["material"],
+            "unit":          item["unit"],
+            "current_stock": item["quantity"],
+            "reorder_at":    item["reorder_at"],
+            "avg_daily_use": avg_daily,
+            "forecast_7d":   forecast_7d,
+            "forecast_30d":  forecast_30d,
+            "trend":         trend,
+            "days_until_stockout": days_until_out,
+            "history":       [{"day": r["day"], "consumed": r["total"]} for r in rows],
+        })
+
+    conn.close()
+    return jsonify(result)
+
+
+# ── /api/demand/production-plan ──────────────────────────
+@app.route("/api/demand/production-plan", methods=["GET", "POST"])
+def production_plan():
+    conn = get_db()
+    _ensure_demand_tables(conn)
+
+    if request.method == "GET":
+        rows = conn.execute("""
+            SELECT pp.*, i.unit, i.quantity as current_stock
+            FROM   production_plans pp
+            LEFT JOIN inventory i ON i.id = pp.inventory_id
+            ORDER  BY pp.start_date, pp.id DESC
+        """).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+
+    data = request.get_json(silent=True) or {}
+    if not data.get("part_name") or not data.get("target_qty"):
+        conn.close()
+        return jsonify({"message": "❌ part_name and target_qty are required"}), 400
+
+    inv_id = data.get("inventory_id")
+    if not inv_id and data.get("part_name"):
+        row = conn.execute(
+            "SELECT id FROM inventory WHERE LOWER(part_name) LIKE LOWER(?)",
+            (f"%{data['part_name']}%",)
+        ).fetchone()
+        if row:
+            inv_id = row["id"]
+
+    conn.execute("""
+        INSERT INTO production_plans
+            (inventory_id, part_name, target_qty, start_date, end_date, notes, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        inv_id,
+        data["part_name"],
+        int(data["target_qty"]),
+        data.get("start_date", ""),
+        data.get("end_date", ""),
+        data.get("notes", ""),
+        data.get("status", "Planned"),
+        datetime.now().isoformat(),
+    ))
+    conn.commit()
+    new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.close()
+    return jsonify({"message": f"✅ Production plan #{new_id} created", "id": new_id})
+
+
+@app.route("/api/demand/production-plan/<int:pid>", methods=["PATCH", "DELETE"])
+def production_plan_item(pid):
+    conn = get_db()
+
+    if request.method == "DELETE":
+        conn.execute("DELETE FROM production_plans WHERE id = ?", (pid,))
+        conn.commit()
+        conn.close()
+        return jsonify({"message": f"✅ Plan #{pid} deleted"})
+
+    data   = request.get_json(silent=True) or {}
+    fields = []
+    vals   = []
+    for col in ("target_qty", "start_date", "end_date", "notes", "status"):
+        if col in data:
+            fields.append(f"{col} = ?")
+            vals.append(data[col])
+    if not fields:
+        conn.close()
+        return jsonify({"message": "Nothing to update"}), 400
+
+    vals.append(pid)
+    conn.execute(f"UPDATE production_plans SET {', '.join(fields)} WHERE id = ?", vals)
+    conn.commit()
+    conn.close()
+    return jsonify({"message": f"✅ Plan #{pid} updated"})
+
+
+# ── /api/demand/suppliers ────────────────────────────────
+@app.route("/api/demand/suppliers", methods=["GET", "POST"])
+def suppliers():
+    conn = get_db()
+    _ensure_demand_tables(conn)
+
+    if request.method == "GET":
+        rows = conn.execute("""
+            SELECT s.*, i.part_name as inv_part_name, i.quantity as current_stock
+            FROM   suppliers s
+            LEFT JOIN inventory i ON i.id = s.inventory_id
+            ORDER  BY s.lead_days
+        """).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+
+    data = request.get_json(silent=True) or {}
+    if not data.get("name"):
+        conn.close()
+        return jsonify({"message": "❌ supplier name is required"}), 400
+
+    inv_id = data.get("inventory_id")
+    if not inv_id and data.get("part_name"):
+        row = conn.execute(
+            "SELECT id FROM inventory WHERE LOWER(part_name) LIKE LOWER(?)",
+            (f"%{data['part_name']}%",)
+        ).fetchone()
+        if row:
+            inv_id = row["id"]
+
+    conn.execute("""
+        INSERT INTO suppliers
+            (name, inventory_id, part_name, lead_days, reliability, contact, notes, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        data["name"],
+        inv_id,
+        data.get("part_name", ""),
+        int(data.get("lead_days", 7)),
+        int(data.get("reliability", 90)),
+        data.get("contact", ""),
+        data.get("notes", ""),
+        datetime.now().isoformat(),
+    ))
+    conn.commit()
+    new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.close()
+    return jsonify({"message": f"✅ Supplier '{data['name']}' added (ID #{new_id})", "id": new_id})
+
+
+@app.route("/api/demand/suppliers/<int:sid>", methods=["DELETE"])
+def delete_supplier(sid):
+    conn = get_db()
+    conn.execute("DELETE FROM suppliers WHERE id = ?", (sid,))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": f"✅ Supplier #{sid} removed"})
+
+
+# ── /api/demand/gap-analysis ─────────────────────────────
+@app.route("/api/demand/gap-analysis")
+def gap_analysis():
+    conn    = get_db()
+    _ensure_demand_tables(conn)
+    items   = conn.execute("SELECT * FROM inventory").fetchall()
+    horizon = int(request.args.get("days", 30))
+
+    result = []
+    for item in items:
+        row = conn.execute("""
+            SELECT COALESCE(SUM(qty_consumed), 0) as total,
+                   COUNT(DISTINCT DATE(scanned_at))  as active_days
+            FROM   scan_events
+            WHERE  inventory_id = ?
+              AND  scanned_at  >= DATE('now', '-30 days')
+        """, (item["id"],)).fetchone()
+
+        total_consumed   = row["total"]
+        avg_daily        = round(total_consumed / 30, 3)
+        projected_demand = round(avg_daily * horizon, 1)
+        gap              = round(item["quantity"] - projected_demand, 1)
+        coverage_days    = round(item["quantity"] / avg_daily) if avg_daily > 0 else None
+
+        supplier = conn.execute("""
+            SELECT name, lead_days, reliability
+            FROM   suppliers
+            WHERE  inventory_id = ?
+            ORDER  BY lead_days
+            LIMIT  1
+        """, (item["id"],)).fetchone()
+
+        pending = conn.execute("""
+            SELECT COALESCE(SUM(quantity), 0) as total
+            FROM   orders
+            WHERE  inventory_id = ? AND status IN ('Received', 'In Review')
+        """, (item["id"],)).fetchone()["total"]
+
+        status = "ok"
+        if gap < 0:
+            status = "critical"
+        elif gap < item["reorder_at"]:
+            status = "warning"
+
+        result.append({
+            "id":               item["id"],
+            "part_name":        item["part_name"],
+            "material":         item["material"],
+            "unit":             item["unit"],
+            "current_stock":    item["quantity"],
+            "reorder_at":       item["reorder_at"],
+            "avg_daily_use":    avg_daily,
+            "projected_demand": projected_demand,
+            "gap":              gap,
+            "coverage_days":    coverage_days,
+            "pending_orders":   pending,
+            "supplier":         dict(supplier) if supplier else None,
+            "status":           status,
+            "horizon_days":     horizon,
+        })
+
+    conn.close()
+    order_map = {"critical": 0, "warning": 1, "ok": 2}
+    result.sort(key=lambda x: order_map.get(x["status"], 3))
+    return jsonify(result)
+    # ─────────────────────────────────────────────────────────
+# FUTURE PREDICTIONS  — append this block to app.py
+# (place it just before the `if __name__ == "__main__":` block)
+# ─────────────────────────────────────────────────────────
+
+import math
+
+
+def _linear_regression(xs, ys):
+    """
+    Simple ordinary-least-squares linear regression.
+    Returns (slope, intercept, r_squared).
+    """
+    n = len(xs)
+    if n < 2:
+        return 0.0, float(ys[0]) if ys else 0.0, 0.0
+
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    ss_xy  = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    ss_xx  = sum((x - mean_x) ** 2 for x in xs)
+
+    if ss_xx == 0:
+        return 0.0, mean_y, 0.0
+
+    slope     = ss_xy / ss_xx
+    intercept = mean_y - slope * mean_x
+
+    # R²
+    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+    ss_tot = sum((y - mean_y) ** 2 for y in ys)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    return slope, intercept, max(0.0, min(1.0, r2))
+
+
+def _predict_stockout(current_stock, daily_consumption_fn, max_days=365):
+    """
+    Walk forward day by day using the consumption function until stock ≤ 0.
+    consumption_fn(day_offset) → predicted units consumed that day.
+    Returns day offset or None if never runs out within max_days.
+    """
+    stock = current_stock
+    for d in range(1, max_days + 1):
+        consume = max(0.0, daily_consumption_fn(d))
+        stock  -= consume
+        if stock <= 0:
+            return d
+    return None
+
+
+@app.route("/api/demand/predictions")
+def demand_predictions():
+    """
+    AI-driven future predictions for every inventory item.
+
+    For each item we:
+    1. Pull the last 60 days of daily consumption from scan_events.
+    2. Fit a linear regression (trend model) over daily totals.
+    3. Project forward for 7 / 14 / 30 / 60 / 90 days.
+    4. Estimate stockout date with confidence bounds.
+    5. Recommend a reorder action with urgency level.
+    6. Return a 30-day day-by-day forecast array for charting.
+    """
+    conn    = get_db()
+    _ensure_demand_tables(conn)
+    horizon = int(request.args.get("days", 30))
+    items   = conn.execute("SELECT * FROM inventory").fetchall()
+
+    results = []
+
+    for item in items:
+        # ── 1. Pull raw daily consumption for last 60 days ──────────
+        rows = conn.execute("""
+            SELECT
+                CAST(julianday('now') - julianday(DATE(scanned_at)) AS INTEGER) AS days_ago,
+                DATE(scanned_at)   AS day,
+                SUM(qty_consumed)  AS consumed
+            FROM scan_events
+            WHERE inventory_id = ?
+              AND scanned_at >= DATE('now', '-60 days')
+            GROUP BY DATE(scanned_at)
+            ORDER BY day ASC
+        """, (item["id"],)).fetchall()
+
+        has_data = len(rows) > 0
+
+        if has_data:
+            # x = day index (0 = oldest data point), y = units consumed
+            xs = list(range(len(rows)))
+            ys = [float(r["consumed"]) for r in rows]
+
+            slope, intercept, r2 = _linear_regression(xs, ys)
+
+            # The "current" day is len(rows) steps from the first data point.
+            # We project forward from there.
+            offset_now  = len(rows)
+
+            def predicted_daily(day_offset):
+                return intercept + slope * (offset_now + day_offset)
+
+            avg_recent  = sum(ys[-7:]) / min(7, len(ys))
+            avg_overall = sum(ys) / len(ys)
+
+            # Residual std-dev for confidence interval
+            preds_in   = [intercept + slope * x for x in xs]
+            residuals  = [abs(y - p) for y, p in zip(ys, preds_in)]
+            residual_sd = (sum(r ** 2 for r in residuals) / len(residuals)) ** 0.5 if residuals else 0
+        else:
+            slope       = 0.0
+            intercept   = 0.0
+            r2          = 0.0
+            offset_now  = 0
+            avg_recent  = 0.0
+            avg_overall = 0.0
+            residual_sd = 0.0
+
+            def predicted_daily(day_offset):
+                return 0.0
+
+        # ── 2. Projected demand for multiple horizons ────────────────
+        def project_horizon(days):
+            total = sum(max(0.0, predicted_daily(d)) for d in range(1, days + 1))
+            lo    = sum(max(0.0, predicted_daily(d) - residual_sd) for d in range(1, days + 1))
+            hi    = sum(max(0.0, predicted_daily(d) + residual_sd) for d in range(1, days + 1))
+            return round(total, 1), round(lo, 1), round(hi, 1)
+
+        p7,  p7_lo,  p7_hi  = project_horizon(7)
+        p14, p14_lo, p14_hi = project_horizon(14)
+        p30, p30_lo, p30_hi = project_horizon(30)
+        p60, p60_lo, p60_hi = project_horizon(60)
+        p90, p90_lo, p90_hi = project_horizon(90)
+
+        # ── 3. Stockout date prediction ──────────────────────────────
+        current_stock = item["quantity"]
+
+        stockout_day      = _predict_stockout(current_stock, predicted_daily) if has_data else None
+        stockout_day_lo   = _predict_stockout(current_stock,
+            lambda d, _sd=residual_sd: predicted_daily(d) + _sd) if has_data else None
+        stockout_day_hi   = _predict_stockout(current_stock,
+            lambda d, _sd=residual_sd: max(0.0, predicted_daily(d) - _sd)) if has_data else None
+
+        # ── 4. Reorder recommendation ────────────────────────────────
+        supplier = conn.execute("""
+            SELECT lead_days, reliability, name
+            FROM   suppliers
+            WHERE  inventory_id = ?
+            ORDER  BY lead_days
+            LIMIT  1
+        """, (item["id"],)).fetchone()
+
+        lead_days   = supplier["lead_days"]   if supplier else 7
+        reliability = supplier["reliability"] if supplier else 90
+
+        # Safety stock = lead_days × avg_daily × (2 - reliability/100)
+        avg_daily_for_ss = avg_recent if has_data else 0.0
+        safety_stock     = math.ceil(lead_days * avg_daily_for_ss * (2 - reliability / 100))
+
+        # Reorder point: enough stock to last through lead time + safety stock
+        reorder_point = math.ceil(lead_days * avg_daily_for_ss + safety_stock)
+
+        # How many to order: cover horizon demand + safety stock - current stock
+        projected_for_horizon = sum(max(0.0, predicted_daily(d)) for d in range(1, horizon + 1))
+        reorder_qty = max(0, math.ceil(projected_for_horizon + safety_stock - current_stock))
+
+        # Urgency
+        if stockout_day is not None and stockout_day <= lead_days:
+            urgency = "critical"    # will run out before supplier can deliver
+        elif stockout_day is not None and stockout_day <= lead_days * 2:
+            urgency = "high"
+        elif current_stock <= reorder_point:
+            urgency = "medium"
+        elif has_data and slope > 0.1 and stockout_day is not None and stockout_day <= 30:
+            urgency = "medium"
+        else:
+            urgency = "low"
+
+        # ── 5. Day-by-day 30-day forecast for charting ───────────────
+        today       = datetime.now().date()
+        daily_chart = []
+        running     = float(current_stock)
+
+        for d in range(1, 31):
+            consume    = max(0.0, predicted_daily(d))
+            consume_lo = max(0.0, predicted_daily(d) - residual_sd)
+            consume_hi = max(0.0, predicted_daily(d) + residual_sd)
+            running   -= consume
+            daily_chart.append({
+                "date":         (today.replace(day=1)  # stable date string
+                                 if False else
+                                 str(today.fromordinal(today.toordinal() + d))),
+                "day":           d,
+                "consumption":   round(consume,    2),
+                "consume_lo":    round(consume_lo, 2),
+                "consume_hi":    round(consume_hi, 2),
+                "stock_eod":     round(max(0.0, running), 1),
+            })
+
+        # ── 6. Trend label & velocity ────────────────────────────────
+        if not has_data:
+            trend_label    = "no data"
+            velocity_label = "unknown"
+        elif slope >  0.5:
+            trend_label    = "accelerating"
+            velocity_label = f"+{round(slope, 2)}/day"
+        elif slope >  0.05:
+            trend_label    = "rising"
+            velocity_label = f"+{round(slope, 2)}/day"
+        elif slope < -0.5:
+            trend_label    = "decelerating"
+            velocity_label = f"{round(slope, 2)}/day"
+        elif slope < -0.05:
+            trend_label    = "falling"
+            velocity_label = f"{round(slope, 2)}/day"
+        else:
+            trend_label    = "stable"
+            velocity_label = "±0"
+
+        results.append({
+            "id":           item["id"],
+            "part_name":    item["part_name"],
+            "material":     item["material"],
+            "unit":         item["unit"] or "pcs",
+            "current_stock": current_stock,
+            "reorder_at":   item["reorder_at"],
+
+            # Model quality
+            "has_data":     has_data,
+            "data_points":  len(rows),
+            "r_squared":    round(r2, 3),
+            "slope":        round(slope, 4),
+            "trend":        trend_label,
+            "velocity":     velocity_label,
+            "avg_daily":    round(avg_overall, 2),
+            "avg_recent_7d": round(avg_recent, 2),
+            "confidence":   round(r2 * 100),
+
+            # Multi-horizon projections
+            "forecast": {
+                "7d":  {"demand": p7,  "lo": p7_lo,  "hi": p7_hi},
+                "14d": {"demand": p14, "lo": p14_lo, "hi": p14_hi},
+                "30d": {"demand": p30, "lo": p30_lo, "hi": p30_hi},
+                "60d": {"demand": p60, "lo": p60_lo, "hi": p60_hi},
+                "90d": {"demand": p90, "lo": p90_lo, "hi": p90_hi},
+            },
+
+            # Stockout prediction
+            "stockout": {
+                "days":    stockout_day,
+                "days_lo": stockout_day_lo,
+                "days_hi": stockout_day_hi,
+                "date":    str(today.fromordinal(today.toordinal() + stockout_day))
+                           if stockout_day else None,
+            },
+
+            # Reorder recommendation
+            "reorder_rec": {
+                "urgency":       urgency,
+                "reorder_point": reorder_point,
+                "safety_stock":  safety_stock,
+                "suggested_qty": reorder_qty,
+                "lead_days":     lead_days,
+                "supplier":      supplier["name"] if supplier else None,
+            },
+
+            # Chart data
+            "daily_forecast": daily_chart,
+        })
+
+    conn.close()
+
+    # Sort: critical first, then high, medium, low, no-data
+    urgency_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    results.sort(key=lambda x: (
+        urgency_order.get(x["reorder_rec"]["urgency"], 4),
+        -(x["current_stock"] == 0),
+    ))
+
+    return jsonify(results)
+
+
+# ─────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Seed some demo orders
-    orders[39] = {
-        "id": 39, "part_name": "Aluminum Bracket", "material": "Aluminum",
-        "quantity": 75, "specs": "", "deadline": "Jul 5",
-        "status": "Received", "quality_logs": [],
-        "created_at": datetime.now().isoformat()
-    }
-    orders[40] = {
-        "id": 40, "part_name": "Copper Pipe 15mm", "material": "Copper",
-        "quantity": 120, "specs": "15mm diameter", "deadline": "Jun 15",
-        "status": "Accepted",
-        "quality_logs": [
-            {"time": "10:00 AM", "note": "All checkpoints passed — cleared for dispatch"}
-        ],
-        "created_at": datetime.now().isoformat()
-    }
-    orders[41] = {
-        "id": 41, "part_name": "Steel Rod 20mm", "material": "Steel",
-        "quantity": 500, "specs": "20mm diameter", "deadline": "Jun 30",
-        "status": "In Review",
-        "quality_logs": [
-            {"time": "09:00 AM", "note": "Awaiting dimensional check"}
-        ],
-        "created_at": datetime.now().isoformat()
-    }
-    app.run(debug=True, port=5000)
+    init_db()
+    app.run(host="0.0.0.0", port=5000, debug=True)

@@ -8,6 +8,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.47.0/tabler-icons.min.css" />
   <link rel="stylesheet" href="/static/css/style.css" />
+  <script src="https://unpkg.com/html5-qrcode"></script>
 </head>
 <body>
 
@@ -38,19 +39,30 @@
         <i class="ti ti-layout-dashboard" aria-hidden="true"></i>
         <span>Dashboard</span>
       </button>
+      <button class="nav-item" onclick="showView('inventory')" data-view="inventory">
+        <i class="ti ti-package" aria-hidden="true"></i>
+        <span>Inventory</span>
+      </button>
+      <button class="nav-item" onclick="showView('rfid')" data-view="rfid">
+        <i class="ti ti-radio" aria-hidden="true"></i>
+        <span>RFID / Scan</span>
+      </button>
     </nav>
 
     <div class="sidebar-divider"></div>
     <div class="sidebar-section-label">Quick Commands</div>
 
     <div class="quick-cmds">
-      <div class="quick-cmd" onclick="injectCmd('I need 500 steel rods 20mm by Aug 10')">
+      <div class="quick-cmd" onclick="injectCmd('Show me inventory')">
+        <i class="ti ti-package" aria-hidden="true"></i> View inventory
+      </div>
+      <div class="quick-cmd" onclick="injectCmd('Order 100 Steel Rod 20mm by Aug 10')">
         <i class="ti ti-plus" aria-hidden="true"></i> Place an order
       </div>
-      <div class="quick-cmd" onclick="injectCmd('Mark order #42 as accepted')">
+      <div class="quick-cmd" onclick="injectCmd('Mark order #1 as accepted')">
         <i class="ti ti-refresh" aria-hidden="true"></i> Update status
       </div>
-      <div class="quick-cmd" onclick="injectCmd('Log quality for order #42: visual inspection passed')">
+      <div class="quick-cmd" onclick="injectCmd('Log quality for order #1: visual inspection passed')">
         <i class="ti ti-shield-check" aria-hidden="true"></i> Log quality
       </div>
       <div class="quick-cmd" onclick="injectCmd('Show me all orders')">
@@ -61,7 +73,7 @@
     <div class="sidebar-footer">
       <div class="sidebar-footer-info">
         <span class="dot green"></span>
-        Claude API connected
+        AI connected
       </div>
     </div>
 
@@ -76,7 +88,7 @@
       <header class="panel-header">
         <div class="header-left">
           <h1 class="panel-title">AI Order Assistant</h1>
-          <p class="panel-sub">Place orders · update status · log quality — all in natural language</p>
+          <p class="panel-sub">Orders are placed against your inventory catalog — add items in the Inventory tab first</p>
         </div>
         <div class="header-right">
           <span class="status-pill">
@@ -87,38 +99,33 @@
       </header>
 
       <div class="chat-body" id="chatMessages">
-
-        <!-- Welcome message -->
         <div class="msg-row ai">
-          <div class="msg-avatar ai-avatar">
-            <i class="ti ti-robot" aria-hidden="true"></i>
-          </div>
           <div class="msg-content">
             <div class="msg-meta">OrderFlow AI <span class="msg-time">now</span></div>
             <div class="msg-bubble">
-              <p>Welcome to <strong>OrderFlow AI</strong> — your conversational manufacturing assistant.</p>
+              <p>Welcome to <strong>OrderFlow AI</strong>. Orders can only be placed for items that exist in your inventory catalog.</p>
+              <p style="color:var(--text-muted);font-size:12.5px;">👉 Go to <strong>Inventory</strong> tab to add items first, then come back here to order them.</p>
               <div class="capability-grid">
                 <div class="cap-item">
                   <i class="ti ti-package" aria-hidden="true"></i>
-                  <span><strong>Place orders</strong><br>Describe what you need in plain language</span>
+                  <span><strong>Order from inventory</strong><br>"Order 100 Steel Rods by Aug 10"</span>
                 </div>
                 <div class="cap-item">
                   <i class="ti ti-refresh-alert" aria-hidden="true"></i>
-                  <span><strong>Update status</strong><br>"Mark order #42 as accepted"</span>
+                  <span><strong>Update status</strong><br>"Mark order #3 as accepted"</span>
                 </div>
                 <div class="cap-item">
-                  <i class="ti ti-shield-check" aria-hidden="true"></i>
-                  <span><strong>Log quality</strong><br>"Log quality for #42: inspection passed"</span>
+                  <i class="ti ti-radio" aria-hidden="true"></i>
+                  <span><strong>Scan to consume</strong><br>RFID/barcode scans reduce stock &amp; auto-reorder</span>
                 </div>
                 <div class="cap-item">
                   <i class="ti ti-search" aria-hidden="true"></i>
-                  <span><strong>Check status</strong><br>"What's the status of order #42?"</span>
+                  <span><strong>Check inventory</strong><br>"Show inventory" or "Check Steel Rod stock"</span>
                 </div>
               </div>
             </div>
           </div>
         </div>
-
       </div>
 
       <div class="chat-footer">
@@ -126,7 +133,7 @@
           <textarea
             id="chatInput"
             class="chat-textarea"
-            placeholder="Type your order or command…"
+            placeholder="e.g. Order 200 Steel Rod 20mm by Sep 1 …"
             rows="1"
             onkeydown="handleKey(event)"
             oninput="autoResize(this)"
@@ -149,8 +156,8 @@
 
       <header class="panel-header">
         <div class="header-left">
-          <h1 class="panel-title">Order Tracking Dashboard</h1>
-          <p class="panel-sub">Real-time manufacturing order visibility</p>
+          <h1 class="panel-title">Order Dashboard</h1>
+          <p class="panel-sub">Real-time manufacturing order &amp; inventory visibility</p>
         </div>
         <div class="header-right">
           <button class="btn-secondary" onclick="loadDashboard()">
@@ -162,75 +169,336 @@
 
       <div class="dashboard-body">
 
+        <!-- Stat tiles -->
         <div class="stats-grid">
           <div class="stat-tile">
-            <div class="stat-icon neutral">
-              <i class="ti ti-clipboard-list" aria-hidden="true"></i>
-            </div>
+            <div class="stat-icon neutral"><i class="ti ti-clipboard-list"></i></div>
             <div class="stat-body">
               <div class="stat-value" id="statTotal">—</div>
               <div class="stat-label">Total Orders</div>
             </div>
           </div>
           <div class="stat-tile">
-            <div class="stat-icon amber">
-              <i class="ti ti-hourglass" aria-hidden="true"></i>
-            </div>
+            <div class="stat-icon amber"><i class="ti ti-hourglass"></i></div>
             <div class="stat-body">
               <div class="stat-value amber" id="statReceived">—</div>
               <div class="stat-label">Received</div>
             </div>
           </div>
           <div class="stat-tile">
-            <div class="stat-icon blue">
-              <i class="ti ti-eye" aria-hidden="true"></i>
-            </div>
+            <div class="stat-icon blue"><i class="ti ti-eye"></i></div>
             <div class="stat-body">
               <div class="stat-value blue" id="statReview">—</div>
               <div class="stat-label">In Review</div>
             </div>
           </div>
           <div class="stat-tile">
-            <div class="stat-icon green">
-              <i class="ti ti-circle-check" aria-hidden="true"></i>
-            </div>
+            <div class="stat-icon green"><i class="ti ti-circle-check"></i></div>
             <div class="stat-body">
               <div class="stat-value green" id="statAccepted">—</div>
               <div class="stat-label">Accepted</div>
             </div>
           </div>
+          <div class="stat-tile">
+            <div class="stat-icon red"><i class="ti ti-alert-triangle"></i></div>
+            <div class="stat-body">
+              <div class="stat-value red" id="statLowStock">—</div>
+              <div class="stat-label">Low Stock Items</div>
+            </div>
+          </div>
         </div>
 
+        <!-- Inventory quick summary -->
+        <div class="table-section" style="margin-bottom:24px">
+          <div class="table-header-row">
+            <h2 class="table-heading">Inventory Snapshot</h2>
+            <button class="btn-secondary" onclick="showView('inventory')">
+              View All <i class="ti ti-arrow-right"></i>
+            </button>
+          </div>
+          <div class="table-wrap">
+            <table class="orders-table">
+              <thead><tr>
+                <th>ID</th><th>Part</th><th>Material</th><th>Stock</th><th>Reorder At</th><th>Status</th><th>Action</th>
+              </tr></thead>
+              <tbody id="inventorySummaryBody">
+                <tr><td colspan="7" class="table-empty"><i class="ti ti-loader"></i> Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Orders table -->
         <div class="table-section">
           <div class="table-header-row">
             <h2 class="table-heading">All Orders</h2>
-            <div class="table-controls">
-              <div class="filter-group" id="filterGroup">
-                <button class="filter-btn active" onclick="filterTable('all', this)">All</button>
-                <button class="filter-btn" onclick="filterTable('Received', this)">Received</button>
-                <button class="filter-btn" onclick="filterTable('In Review', this)">In Review</button>
-                <button class="filter-btn" onclick="filterTable('Accepted', this)">Accepted</button>
-              </div>
+            <div class="filter-group" id="filterGroup">
+              <button class="filter-btn active" onclick="filterTable('all', this)">All</button>
+              <button class="filter-btn" onclick="filterTable('Received', this)">Received</button>
+              <button class="filter-btn" onclick="filterTable('In Review', this)">In Review</button>
+              <button class="filter-btn" onclick="filterTable('Accepted', this)">Accepted</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="orders-table" id="ordersTable">
+              <thead><tr>
+                <th>Order ID</th><th>Part Name</th><th>Material</th><th>Qty</th><th>Deadline</th><th>Status</th><th>Set Status</th>
+              </tr></thead>
+              <tbody id="ordersTableBody">
+                <tr><td colspan="6" class="table-empty"><i class="ti ti-loader"></i> Loading orders…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- ═══════════════════════════════════════════════════════════
+             MANAGEMENT TO MEET DEMAND — accordion section
+             ═══════════════════════════════════════════════════════════ -->
+        <div class="demand-section" id="demandMgmt" style="margin-top:24px">
+
+          <div class="demand-section-header" onclick="toggleDemandSection()">
+            <div class="demand-section-title">
+              <i class="ti ti-trending-up"></i>
+              Management to Meet Demand
+            </div>
+            <div class="demand-section-meta">
+              <span class="demand-section-badge" id="demandAlertBadge">Loading…</span>
+              <i class="ti ti-chevron-down demand-chevron" id="demandChevron"></i>
             </div>
           </div>
 
+          <div class="demand-section-body" id="demandBody">
+
+            <!-- Horizon selector -->
+            <div class="horizon-row">
+              <span class="horizon-label">Forecast horizon:</span>
+              <button class="horizon-btn" onclick="setHorizon(7,  this)">7 days</button>
+              <button class="horizon-btn active" onclick="setHorizon(30, this)">30 days</button>
+              <button class="horizon-btn" onclick="setHorizon(60, this)">60 days</button>
+              <button class="horizon-btn" onclick="setHorizon(90, this)">90 days</button>
+            </div>
+
+            <!-- 2×2 panel grid -->
+            <div class="demand-grid">
+
+              <!-- ① DEMAND FORECAST -->
+              <div class="demand-panel">
+                <div class="demand-panel-head">
+                  <i class="ti ti-chart-line"></i>
+                  <span>Demand Forecast</span>
+                </div>
+                <div class="demand-panel-body">
+                  <div id="forecastList" class="forecast-list">
+                    <div class="demand-loading"><i class="ti ti-loader"></i> Loading forecast…</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ② GAP ANALYSIS -->
+              <div class="demand-panel">
+                <div class="demand-panel-head">
+                  <i class="ti ti-git-diff"></i>
+                  <span>Gap Analysis</span>
+                </div>
+                <div class="demand-panel-body" style="padding:0">
+                  <div style="overflow-x:auto">
+                    <table class="gap-table" id="gapTable">
+                      <thead>
+                        <tr>
+                          <th>Part</th>
+                          <th>Stock</th>
+                          <th>Needed</th>
+                          <th>Gap</th>
+                          <th>Cover</th>
+                          <th>Status</th>
+                        </tr>
+                      </thead>
+                      <tbody id="gapTableBody">
+                        <tr><td colspan="6" class="demand-loading">
+                          <i class="ti ti-loader"></i> Analysing…
+                        </td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ③ PRODUCTION PLANNING -->
+              <div class="demand-panel">
+                <div class="demand-panel-head">
+                  <i class="ti ti-calendar-event"></i>
+                  <span>Production Planning</span>
+                </div>
+                <div class="demand-panel-body">
+                  <div class="prod-plan-form">
+                    <div>
+                      <label class="pp-label">Part name *</label>
+                      <input id="pp-part"  class="pp-input" placeholder="Steel Rod 20mm" />
+                    </div>
+                    <div>
+                      <label class="pp-label">Target qty *</label>
+                      <input id="pp-qty"   class="pp-input" type="number" min="1" placeholder="500" />
+                    </div>
+                    <div>
+                      <label class="pp-label">Start date</label>
+                      <input id="pp-start" class="pp-input" type="date" />
+                    </div>
+                    <div>
+                      <label class="pp-label">End date</label>
+                      <input id="pp-end"   class="pp-input" type="date" />
+                    </div>
+                  </div>
+                  <div style="display:flex;gap:8px;margin-bottom:14px">
+                    <button class="pp-add-btn" onclick="addProductionPlan()">
+                      <i class="ti ti-plus"></i> Add Plan
+                    </button>
+                    <span id="ppMsg" style="font-size:12px;line-height:1.8"></span>
+                  </div>
+                  <div id="prodPlanList" class="prod-plan-list">
+                    <div class="demand-loading"><i class="ti ti-loader"></i> Loading plans…</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ④ SUPPLIER LEAD TIMES -->
+              <div class="demand-panel">
+                <div class="demand-panel-head">
+                  <i class="ti ti-truck"></i>
+                  <span>Supplier Lead Times</span>
+                </div>
+                <div class="demand-panel-body">
+                  <div class="supplier-form">
+                    <div>
+                      <label class="pp-label">Supplier name *</label>
+                      <input id="sup-name"  class="pp-input" placeholder="Acme Metals Ltd." />
+                    </div>
+                    <div>
+                      <label class="pp-label">Part / item</label>
+                      <input id="sup-part"  class="pp-input" placeholder="Steel Rod 20mm" />
+                    </div>
+                    <div>
+                      <label class="pp-label">Lead days</label>
+                      <input id="sup-lead"  class="pp-input" type="number" min="1" value="7" placeholder="7" />
+                    </div>
+                    <div>
+                      <label class="pp-label">Reliability %</label>
+                      <input id="sup-rel"   class="pp-input" type="number" min="0" max="100" value="90" placeholder="90" />
+                    </div>
+                  </div>
+                  <div style="display:flex;gap:8px;margin-bottom:14px">
+                    <button class="pp-add-btn" onclick="addSupplier()">
+                      <i class="ti ti-plus"></i> Add Supplier
+                    </button>
+                    <span id="supMsg" style="font-size:12px;line-height:1.8"></span>
+                  </div>
+                  <div id="supplierList" class="supplier-list">
+                    <div class="demand-loading"><i class="ti ti-loader"></i> Loading suppliers…</div>
+                  </div>
+                </div>
+              </div>
+
+            </div><!-- /demand-grid -->
+          </div><!-- /demand-section-body -->
+        </div><!-- /demandMgmt -->
+
+      </div><!-- /dashboard-body -->
+    </div><!-- /view-dashboard -->
+
+    <!-- ═══ INVENTORY VIEW ════════════════════════════════ -->
+    <div class="view" id="view-inventory">
+
+      <header class="panel-header">
+        <div class="header-left">
+          <h1 class="panel-title">Inventory Catalog</h1>
+          <p class="panel-sub">Add items here first — only catalog items can be ordered via chat</p>
+        </div>
+        <div class="header-right">
+          <button class="btn-secondary" onclick="loadInventoryView()">
+            <i class="ti ti-refresh"></i> Refresh
+          </button>
+        </div>
+      </header>
+
+      <div class="dashboard-body">
+
+        <!-- ══ ADD INVENTORY ITEM FORM ══ -->
+        <div class="table-section" style="margin-bottom:24px">
+          <div class="table-header-row">
+            <h2 class="table-heading"><i class="ti ti-plus" style="margin-right:6px"></i>Add New Inventory Item</h2>
+          </div>
+          <div style="padding:20px">
+            <div class="add-inv-grid">
+              <div class="add-inv-field">
+                <label class="add-inv-label">Part Name <span style="color:var(--red)">*</span></label>
+                <input id="inv-part-name" class="scanner-input" style="margin-bottom:0" placeholder="e.g. Steel Rod 20mm" />
+              </div>
+              <div class="add-inv-field">
+                <label class="add-inv-label">Material</label>
+                <input id="inv-material" class="scanner-input" style="margin-bottom:0" placeholder="e.g. Steel, Aluminium" />
+              </div>
+              <div class="add-inv-field">
+                <label class="add-inv-label">Unit</label>
+                <input id="inv-unit" class="scanner-input" style="margin-bottom:0" placeholder="pcs / m / kg" value="pcs" />
+              </div>
+              <div class="add-inv-field">
+                <label class="add-inv-label">Initial Stock Qty</label>
+                <input id="inv-qty" type="number" min="0" class="scanner-input" style="margin-bottom:0" placeholder="0" value="0" />
+              </div>
+              <div class="add-inv-field">
+                <label class="add-inv-label">Reorder Threshold</label>
+                <input id="inv-reorder" type="number" min="1" class="scanner-input" style="margin-bottom:0" placeholder="10" value="10" />
+              </div>
+              <div class="add-inv-field">
+                <label class="add-inv-label">Barcode (optional)</label>
+                <input id="inv-barcode" class="scanner-input" style="margin-bottom:0" placeholder="e.g. ORDER-XYZ" />
+              </div>
+              <div class="add-inv-field">
+                <label class="add-inv-label">RFID Tag (optional)</label>
+                <input id="inv-rfid" class="scanner-input" style="margin-bottom:0" placeholder="e.g. RFID-A3F92C1B" />
+              </div>
+            </div>
+            <div style="margin-top:16px;display:flex;align-items:center;gap:12px">
+              <button class="scanner-btn" onclick="addInventoryItem()">
+                <i class="ti ti-plus"></i> Add to Inventory
+              </button>
+              <button class="btn-secondary" onclick="clearAddForm()">Clear</button>
+              <span id="addInventoryResult" style="font-size:13px"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ══ BARCODE SCANNER ══ -->
+        <div class="scanner-section">
+          <div class="scanner-header">
+            <h2>
+              Barcode Scanner
+              <span class="optional-badge">Optional — scan to consume stock</span>
+            </h2>
+          </div>
+          <div class="scanner-grid">
+            <div class="scanner-card">
+              <div class="scanner-title"><i class="ti ti-barcode"></i> Barcode</div>
+              <input type="text" id="barcodeInput" class="scanner-input" placeholder="Scan or type Barcode (e.g. ORDER-SR20)" />
+              <button class="scanner-btn" onclick="lookupBarcode()">Scan Barcode</button>
+              <button class="scanner-btn secondary" onclick="startBarcodeCamera()">Use Camera</button>
+            </div>
+          </div>
+          <div id="reader"></div>
+          <div id="scanResult"></div>
+        </div>
+
+        <!-- ══ ALL INVENTORY TABLE ══ -->
+        <div class="table-section">
+          <div class="table-header-row">
+            <h2 class="table-heading">All Inventory Items</h2>
+          </div>
           <div class="table-wrap">
-            <table class="orders-table" id="ordersTable">
-              <thead>
-                <tr>
-                  <th>Order ID</th>
-                  <th>Part Name</th>
-                  <th>Material</th>
-                  <th>Qty</th>
-                  <th>Deadline</th>
-                  <th>Status</th>
-                  <th>Latest Quality Note</th>
-                </tr>
-              </thead>
-              <tbody id="ordersTableBody">
-                <tr><td colspan="7" class="table-empty">
-                  <i class="ti ti-loader" aria-hidden="true"></i> Loading orders…
-                </td></tr>
+            <table class="orders-table">
+              <thead><tr>
+                <th>ID</th><th>Part</th><th>Material</th><th>Unit</th><th>Stock</th><th>Reorder At</th><th>Level</th><th>Status</th><th>Order</th><th>Delete</th>
+              </tr></thead>
+              <tbody id="inventoryTableBody">
+                <tr><td colspan="10" class="table-empty"><i class="ti ti-loader"></i> Loading inventory…</td></tr>
               </tbody>
             </table>
           </div>
@@ -239,7 +507,132 @@
       </div>
     </div>
 
+    <!-- ═══ RFID SCANNER VIEW ════════════════════════════ -->
+    <div class="view" id="view-rfid">
+
+      <header class="panel-header">
+        <div class="header-left">
+          <h1 class="panel-title">RFID Scanner</h1>
+          <p class="panel-sub">Optional · scans consume inventory &amp; auto-trigger reorders when stock falls low</p>
+        </div>
+        <div class="header-right">
+          <button class="btn-secondary" id="rfidToggleBtn" onclick="toggleRFIDScanner()">
+            ⏸ Pause
+          </button>
+        </div>
+      </header>
+
+      <div class="rfid-body">
+
+        <div class="rfid-status-bar">
+          <span class="rfid-dot rfid-dot--active" id="rfidStatusDot"></span>
+          <span class="rfid-status-text" id="rfidStatusText">Listening for RFID tag…</span>
+          <span class="rfid-last-tag-label">Last tag:</span>
+          <code class="rfid-last-tag" id="rfidLastTag">—</code>
+        </div>
+
+        <div class="rfid-info-card">
+          <div class="rfid-info__title"><i class="ti ti-info-circle"></i> How RFID scanning works in OrderFlow</div>
+          <div class="rfid-info__body">
+            RFID and barcode scanning is <strong>optional</strong> — you can place orders directly via chat.
+            When you <em>do</em> scan a tag, it will:
+            <ol>
+              <li>Look up the matching <strong>inventory item</strong> by RFID tag</li>
+              <li>Reduce stock by 1 unit (consumption event)</li>
+              <li>Check if stock has reached the <strong>reorder threshold</strong></li>
+              <li>If yes — <strong>auto-create a purchase order</strong> for that item</li>
+              <li>Play an audio confirmation beep</li>
+            </ol>
+            Add items with RFID tags in the <strong>Inventory</strong> tab.
+          </div>
+        </div>
+
+        <div class="rfid-panel" id="rfidScanPanel">
+          <div class="rfid-panel__inner">
+            <div class="rfid-panel__icon">
+              <i class="ti ti-radio" aria-hidden="true"></i>
+            </div>
+            <div class="rfid-panel__label">Hold tag near reader or enter tag manually</div>
+            <div class="rfid-manual-row">
+              <input
+                type="text"
+                id="rfidInput"
+                class="rfid-manual-input"
+                placeholder="e.g. RFID-A3F92C1B"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <button class="rfid-manual-btn" onclick="lookupRFID()">
+                <i class="ti ti-scan"></i> Scan
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="rfid-result" id="rfidScanResult"></div>
+
+        <div class="rfid-log-section">
+          <div class="rfid-log-header">
+            <span class="rfid-log-title">
+              <i class="ti ti-history"></i>
+              Scan Event Log
+            </span>
+            <button class="btn-secondary" onclick="clearRFIDLog()" style="font-size:12px;padding:4px 10px;">
+              Clear
+            </button>
+          </div>
+          <div class="rfid-event-log" id="rfidEventLog">
+            <div class="rfid-log-empty">No scans yet — waiting for tags…</div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
   </main>
+</div>
+<!-- ════════════════════════════════════════════════════════════════
+     FUTURE PREDICTIONS — insert into dashboard-body, after demandMgmt div
+     ════════════════════════════════════════════════════════════════ -->
+
+<div class="pred-section" id="predSection" style="margin-top:24px">
+
+    <div class="pred-section-header" onclick="togglePredSection()">
+        <div class="pred-section-title">
+            <i class="ti ti-crystal-ball"></i>
+            Future Predictions
+            <span style="font-size:10px;font-weight:500;padding:2px 8px;border-radius:10px;background:var(--blue-dim);border:1px solid var(--blue-bd);color:var(--blue);margin-left:4px">AI · Linear Regression</span>
+        </div>
+        <div class="pred-section-meta">
+            <span class="pred-section-badge" id="predAlertBadge">Loading…</span>
+            <i class="ti ti-chevron-down pred-section-chevron" id="predChevron"></i>
+        </div>
+    </div>
+
+    <div class="pred-section-body" id="predBody">
+
+        <!-- Horizon selector -->
+        <div class="pred-horizon-row">
+            <span class="pred-horizon-label">Forecast horizon:</span>
+            <button class="pred-horizon-btn" onclick="setPredHorizon(7,  this)">7 days</button>
+            <button class="pred-horizon-btn" onclick="setPredHorizon(14, this)">14 days</button>
+            <button class="pred-horizon-btn active" onclick="setPredHorizon(30, this)">30 days</button>
+            <button class="pred-horizon-btn" onclick="setPredHorizon(60, this)">60 days</button>
+            <button class="pred-horizon-btn" onclick="setPredHorizon(90, this)">90 days</button>
+            <button class="btn-secondary" style="margin-left:auto;font-size:12px;padding:4px 12px" onclick="predLoaded=false;loadPredictions()">
+                <i class="ti ti-refresh"></i> Recalculate
+            </button>
+        </div>
+
+        <!-- Cards grid (populated by JS) -->
+        <div id="predGrid">
+            <div class="pred-loading-state">
+                <div class="pred-loader-ring"></div>
+                <span>Running regression models…</span>
+            </div>
+        </div>
+
+    </div>
 </div>
 
 <script src="/static/js/app.js"></script>
