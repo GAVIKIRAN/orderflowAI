@@ -1,11 +1,141 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=\, initial-scale=1.0">
-    <title>Document</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OrderFlow AI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/style.css" />
 </head>
 <body>
-    
+
+<!-- ── SIDEBAR ───────────────────────────────────────────── -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <div class="logo">
+      <span class="logo-mark">OF</span>
+      <div>
+        <div class="logo-name">OrderFlow <span class="logo-ai">AI</span></div>
+        <div class="logo-sub">Manufacturing OS</div>
+      </div>
+    </div>
+  </div>
+
+  <nav class="sidebar-nav">
+    <button class="nav-btn active" onclick="showView('chat')" data-view="chat">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      Chat
+    </button>
+    <button class="nav-btn" onclick="showView('dashboard')" data-view="dashboard">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+      Dashboard
+    </button>
+  </nav>
+
+  <div class="sidebar-tip">
+    <div class="tip-label">Try saying</div>
+    <div class="tip-text">"I need 200 titanium flanges, 80mm bore, by July 20"</div>
+  </div>
+</aside>
+
+<!-- ── MAIN ──────────────────────────────────────────────── -->
+<main class="main">
+
+  <!-- CHAT VIEW -->
+  <div class="view active" id="view-chat">
+    <div class="chat-topbar">
+      <div class="chat-title">
+        <span class="status-dot pulse"></span>
+        AI Order Assistant
+      </div>
+      <div class="chat-hint">Place orders · Update status · Log quality — all in natural language</div>
+    </div>
+
+    <div class="chat-messages" id="chatMessages">
+      <div class="msg bot intro-msg">
+        <div class="msg-avatar">AI</div>
+        <div class="msg-bubble">
+          <p>👋 Welcome to <strong>OrderFlow AI</strong> — your conversational manufacturing assistant.</p>
+          <p>I can help you:</p>
+          <ul>
+            <li>📦 <strong>Place orders</strong> — just describe what you need</li>
+            <li>🔄 <strong>Update status</strong> — "Mark order #42 as accepted"</li>
+            <li>🛡️ <strong>Log quality</strong> — "Log quality for #42: visual inspection passed"</li>
+            <li>🔍 <strong>Check status</strong> — "What's the status of order #42?"</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="chat-input-area">
+      <div class="chat-input-wrap">
+        <textarea
+          id="chatInput"
+          class="chat-input"
+          placeholder="Type your order or command..."
+          rows="1"
+          onkeydown="handleKey(event)"
+          oninput="autoResize(this)"
+        ></textarea>
+        <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- DASHBOARD VIEW -->
+  <div class="view" id="view-dashboard">
+    <div class="dash-topbar">
+      <h1 class="dash-title">Order Tracking Dashboard</h1>
+      <button class="refresh-btn" onclick="loadDashboard()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        Refresh
+      </button>
+    </div>
+
+    <div class="stats-row" id="statsRow">
+      <div class="stat-card">
+        <div class="stat-num" id="statTotal">0</div>
+        <div class="stat-label">Total Orders</div>
+      </div>
+      <div class="stat-card blue">
+        <div class="stat-num" id="statReview">0</div>
+        <div class="stat-label">In Review</div>
+      </div>
+      <div class="stat-card green">
+        <div class="stat-num" id="statAccepted">0</div>
+        <div class="stat-label">Accepted</div>
+      </div>
+      <div class="stat-card amber">
+        <div class="stat-num" id="statReceived">0</div>
+        <div class="stat-label">Received</div>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table class="orders-table">
+        <thead>
+          <tr>
+            <th>Order ID</th>
+            <th>Part Name</th>
+            <th>Material</th>
+            <th>Qty</th>
+            <th>Deadline</th>
+            <th>Status</th>
+            <th>Latest Quality Note</th>
+          </tr>
+        </thead>
+        <tbody id="ordersTableBody">
+          <tr><td colspan="7" class="empty-row">Loading orders...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</main>
+
+<script src="/static/js/app.js"></script>
 </body>
 </html>
